@@ -4,24 +4,28 @@ mod render;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
-    AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    resolve_saved_oauth_token, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{render_slash_command_help, resume_supported_slash_commands, SlashCommand};
 use compat_harness::{extract_manifest, UpstreamPaths};
 use render::{Spinner, TerminalRenderer};
 use runtime::{
-    load_system_prompt, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, MessageRole,
-    PermissionMode, PermissionPolicy, ProjectContext, RuntimeError, Session, TokenUsage, ToolError,
-    ToolExecutor, UsageTracker,
+    clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
+    parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
+    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest,
+    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
 use tools::{execute_tool, mvp_tool_specs};
@@ -29,6 +33,7 @@ use tools::{execute_tool, mvp_tool_specs};
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const DEFAULT_MAX_TOKENS: u32 = 32;
 const DEFAULT_DATE: &str = "2026-03-31";
+const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
@@ -64,6 +69,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
         } => LiveCli::new(model, false, allowed_tools)?
             .run_turn_with_output(&prompt, output_format)?,
+        CliAction::Login => run_login()?,
+        CliAction::Logout => run_logout()?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -92,6 +99,8 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
     },
+    Login,
+    Logout,
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -199,6 +208,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
+        "login" => Ok(CliAction::Login),
+        "logout" => Ok(CliAction::Logout),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -342,6 +353,122 @@ fn print_bootstrap_plan() {
     for phase in runtime::BootstrapPlan::claude_code_default().phases() {
         println!("- {phase:?}");
     }
+}
+
+fn run_login() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let config = ConfigLoader::default_for(&cwd).load()?;
+    let oauth = config.oauth().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "OAuth config is missing. Add settings.oauth.clientId/authorizeUrl/tokenUrl first.",
+        )
+    })?;
+    let callback_port = oauth.callback_port.unwrap_or(DEFAULT_OAUTH_CALLBACK_PORT);
+    let redirect_uri = runtime::loopback_redirect_uri(callback_port);
+    let pkce = generate_pkce_pair()?;
+    let state = generate_state()?;
+    let authorize_url =
+        OAuthAuthorizationRequest::from_config(oauth, redirect_uri.clone(), state.clone(), &pkce)
+            .build_url();
+
+    println!("Starting Claude OAuth login...");
+    println!("Listening for callback on {redirect_uri}");
+    if let Err(error) = open_browser(&authorize_url) {
+        eprintln!("warning: failed to open browser automatically: {error}");
+        println!("Open this URL manually:\n{authorize_url}");
+    }
+
+    let callback = wait_for_oauth_callback(callback_port)?;
+    if let Some(error) = callback.error {
+        let description = callback
+            .error_description
+            .unwrap_or_else(|| "authorization failed".to_string());
+        return Err(io::Error::other(format!("{error}: {description}")).into());
+    }
+    let code = callback.code.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "callback did not include code")
+    })?;
+    let returned_state = callback.state.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "callback did not include state")
+    })?;
+    if returned_state != state {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "oauth state mismatch").into());
+    }
+
+    let client = AnthropicClient::from_auth(AuthSource::None);
+    let exchange_request =
+        OAuthTokenExchangeRequest::from_config(oauth, code, state, pkce.verifier, redirect_uri);
+    let runtime = tokio::runtime::Runtime::new()?;
+    let token_set = runtime.block_on(client.exchange_oauth_code(oauth, &exchange_request))?;
+    save_oauth_credentials(&runtime::OAuthTokenSet {
+        access_token: token_set.access_token,
+        refresh_token: token_set.refresh_token,
+        expires_at: token_set.expires_at,
+        scopes: token_set.scopes,
+    })?;
+    println!("Claude OAuth login complete.");
+    Ok(())
+}
+
+fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
+    clear_oauth_credentials()?;
+    println!("Claude OAuth credentials cleared.");
+    Ok(())
+}
+
+fn open_browser(url: &str) -> io::Result<()> {
+    let commands = if cfg!(target_os = "macos") {
+        vec![("open", vec![url])]
+    } else if cfg!(target_os = "windows") {
+        vec![("cmd", vec!["/C", "start", "", url])]
+    } else {
+        vec![("xdg-open", vec![url])]
+    };
+    for (program, args) in commands {
+        match Command::new(program).args(args).spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no supported browser opener command found",
+    ))
+}
+
+fn wait_for_oauth_callback(
+    port: u16,
+) -> Result<runtime::OAuthCallbackParams, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let (mut stream, _) = listener.accept()?;
+    let mut buffer = [0_u8; 4096];
+    let bytes_read = stream.read(&mut buffer)?;
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request_line = request.lines().next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing callback request line")
+    })?;
+    let target = request_line.split_whitespace().nth(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing callback request target",
+        )
+    })?;
+    let callback = parse_oauth_callback_request_target(target)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let body = if callback.error.is_some() {
+        "Claude OAuth login failed. You can close this window."
+    } else {
+        "Claude OAuth login succeeded. You can close this window."
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes())?;
+    Ok(callback)
 }
 
 fn print_system_prompt(cwd: PathBuf, date: String) {
@@ -840,7 +967,7 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let client = AnthropicClient::from_env()?;
+        let client = AnthropicClient::from_auth(resolve_cli_auth_source()?);
         let request = MessageRequest {
             model: self.model.clone(),
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -1742,11 +1869,28 @@ impl AnthropicRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_env()?,
+            client: AnthropicClient::from_auth(resolve_cli_auth_source()?),
             model,
             enable_tools,
             allowed_tools,
         })
+    }
+}
+
+fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
+    match AuthSource::from_env() {
+        Ok(auth) => Ok(auth),
+        Err(api::ApiError::MissingApiKey) => {
+            let cwd = env::current_dir()?;
+            let config = ConfigLoader::default_for(&cwd).load()?;
+            if let Some(oauth) = config.oauth() {
+                if let Some(token_set) = resolve_saved_oauth_token(oauth)? {
+                    return Ok(AuthSource::from(token_set));
+                }
+            }
+            Ok(AuthSource::from_env_or_saved()?)
+        }
+        Err(error) => Err(Box::new(error)),
     }
 }
 
@@ -2019,6 +2163,8 @@ fn print_help() {
     println!("  rusty-claude-cli dump-manifests");
     println!("  rusty-claude-cli bootstrap-plan");
     println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
+    println!("  rusty-claude-cli login");
+    println!("  rusty-claude-cli logout");
     println!();
     println!("Flags:");
     println!("  --model MODEL              Override the active model");
@@ -2043,6 +2189,7 @@ fn print_help() {
     println!("  rusty-claude-cli --output-format json prompt \"explain src/main.rs\"");
     println!("  rusty-claude-cli --allowedTools read,glob \"summarize Cargo.toml\"");
     println!("  rusty-claude-cli --resume session.json /status /diff /export notes.txt");
+    println!("  rusty-claude-cli login");
 }
 
 #[cfg(test)]
@@ -2163,6 +2310,18 @@ mod tests {
                 cwd: PathBuf::from("/tmp/project"),
                 date: "2026-04-01".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_login_and_logout_subcommands() {
+        assert_eq!(
+            parse_args(&["login".to_string()]).expect("login should parse"),
+            CliAction::Login
+        );
+        assert_eq!(
+            parse_args(&["logout".to_string()]).expect("logout should parse"),
+            CliAction::Logout
         );
     }
 

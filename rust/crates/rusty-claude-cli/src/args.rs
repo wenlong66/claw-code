@@ -31,6 +31,10 @@ pub enum Command {
     DumpManifests,
     /// Print the current bootstrap phase skeleton
     BootstrapPlan,
+    /// Start the OAuth login flow
+    Login,
+    /// Clear saved OAuth credentials
+    Logout,
     /// Run a non-interactive prompt and exit
     Prompt { prompt: Vec<String> },
 }
@@ -85,5 +89,14 @@ mod tests {
                 prompt: vec!["hello".into(), "world".into()]
             })
         );
+    }
+
+    #[test]
+    fn parses_login_and_logout_commands() {
+        let login = Cli::parse_from(["rusty-claude-cli", "login"]);
+        assert_eq!(login.command, Some(Command::Login));
+
+        let logout = Cli::parse_from(["rusty-claude-cli", "logout"]);
+        assert_eq!(logout.command, Some(Command::Logout));
     }
 }

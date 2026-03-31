@@ -64,6 +64,26 @@ cd rust
 cargo run -p rusty-claude-cli -- --version
 ```
 
+### Login with OAuth
+
+Configure `settings.json` with an `oauth` block containing `clientId`, `authorizeUrl`, `tokenUrl`, optional `callbackPort`, and optional `scopes`, then run:
+
+```bash
+cd rust
+cargo run -p rusty-claude-cli -- login
+```
+
+This opens the browser, listens on the configured localhost callback, exchanges the auth code for tokens, and stores OAuth credentials in `~/.claude/credentials.json` (or `$CLAUDE_CONFIG_HOME/credentials.json`).
+
+### Logout
+
+```bash
+cd rust
+cargo run -p rusty-claude-cli -- logout
+```
+
+This removes only the stored OAuth credentials and preserves unrelated JSON fields in `credentials.json`.
+
 ## Usage examples
 
 ### 1) Prompt mode
@@ -155,8 +175,9 @@ cargo run -p rusty-claude-cli -- --resume session.json /memory /config
 
 ### Anthropic/API
 
-- `ANTHROPIC_AUTH_TOKEN` — preferred bearer token for API auth
-- `ANTHROPIC_API_KEY` — legacy API key fallback if auth token is unset
+- `ANTHROPIC_API_KEY` — highest-precedence API credential
+- `ANTHROPIC_AUTH_TOKEN` — bearer-token override used when no API key is set
+- Persisted OAuth credentials in `~/.claude/credentials.json` — used when neither env var is set
 - `ANTHROPIC_BASE_URL` — override the Anthropic API base URL
 - `ANTHROPIC_MODEL` — default model used by selected live integration tests
 

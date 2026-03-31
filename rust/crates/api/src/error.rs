@@ -5,6 +5,8 @@ use std::time::Duration;
 #[derive(Debug)]
 pub enum ApiError {
     MissingApiKey,
+    ExpiredOAuthToken,
+    Auth(String),
     InvalidApiKeyEnv(VarError),
     Http(reqwest::Error),
     Io(std::io::Error),
@@ -35,6 +37,8 @@ impl ApiError {
             Self::Api { retryable, .. } => *retryable,
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingApiKey
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Io(_)
             | Self::Json(_)
@@ -53,6 +57,13 @@ impl Display for ApiError {
                     "ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY is not set; export one before calling the Anthropic API"
                 )
             }
+            Self::ExpiredOAuthToken => {
+                write!(
+                    f,
+                    "saved OAuth token is expired and no refresh token is available"
+                )
+            }
+            Self::Auth(message) => write!(f, "auth error: {message}"),
             Self::InvalidApiKeyEnv(error) => {
                 write!(
                     f,

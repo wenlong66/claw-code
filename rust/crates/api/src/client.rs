@@ -1,6 +1,10 @@
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use runtime::{
+    load_oauth_credentials, save_oauth_credentials, OAuthConfig, OAuthRefreshRequest,
+    OAuthTokenExchangeRequest,
+};
 use serde::Deserialize;
 
 use crate::error::ApiError;
@@ -81,11 +85,12 @@ impl AuthSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct OAuthTokenSet {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<u64>,
+    #[serde(default)]
     pub scopes: Vec<String>,
 }
 
@@ -131,7 +136,7 @@ impl AnthropicClient {
     }
 
     pub fn from_env() -> Result<Self, ApiError> {
-        Ok(Self::from_auth(AuthSource::from_env()?).with_base_url(read_base_url()))
+        Ok(Self::from_auth(AuthSource::from_env_or_saved()?).with_base_url(read_base_url()))
     }
 
     #[must_use]
@@ -225,6 +230,46 @@ impl AnthropicClient {
         })
     }
 
+    pub async fn exchange_oauth_code(
+        &self,
+        config: &OAuthConfig,
+        request: &OAuthTokenExchangeRequest,
+    ) -> Result<OAuthTokenSet, ApiError> {
+        let response = self
+            .http
+            .post(&config.token_url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .form(&request.form_params())
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let response = expect_success(response).await?;
+        response
+            .json::<OAuthTokenSet>()
+            .await
+            .map_err(ApiError::from)
+    }
+
+    pub async fn refresh_oauth_token(
+        &self,
+        config: &OAuthConfig,
+        request: &OAuthRefreshRequest,
+    ) -> Result<OAuthTokenSet, ApiError> {
+        let response = self
+            .http
+            .post(&config.token_url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .form(&request.form_params())
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let response = expect_success(response).await?;
+        response
+            .json::<OAuthTokenSet>()
+            .await
+            .map_err(ApiError::from)
+    }
+
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
@@ -304,6 +349,99 @@ impl AnthropicClient {
     }
 }
 
+impl AuthSource {
+    pub fn from_env_or_saved() -> Result<Self, ApiError> {
+        if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
+            return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
+                Some(bearer_token) => Ok(Self::ApiKeyAndBearer {
+                    api_key,
+                    bearer_token,
+                }),
+                None => Ok(Self::ApiKey(api_key)),
+            };
+        }
+        if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
+            return Ok(Self::BearerToken(bearer_token));
+        }
+        match load_saved_oauth_token() {
+            Ok(Some(token_set)) if oauth_token_is_expired(&token_set) => {
+                if token_set.refresh_token.is_some() {
+                    Err(ApiError::Auth(
+                        "saved OAuth token is expired; load runtime OAuth config to refresh it"
+                            .to_string(),
+                    ))
+                } else {
+                    Err(ApiError::ExpiredOAuthToken)
+                }
+            }
+            Ok(Some(token_set)) => Ok(Self::BearerToken(token_set.access_token)),
+            Ok(None) => Err(ApiError::MissingApiKey),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[must_use]
+pub fn oauth_token_is_expired(token_set: &OAuthTokenSet) -> bool {
+    token_set
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_unix_timestamp())
+}
+
+pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTokenSet>, ApiError> {
+    let Some(token_set) = load_saved_oauth_token()? else {
+        return Ok(None);
+    };
+    if !oauth_token_is_expired(&token_set) {
+        return Ok(Some(token_set));
+    }
+    let Some(refresh_token) = token_set.refresh_token.clone() else {
+        return Err(ApiError::ExpiredOAuthToken);
+    };
+    let client = AnthropicClient::from_auth(AuthSource::None).with_base_url(read_base_url());
+    let refreshed = client_runtime_block_on(async {
+        client
+            .refresh_oauth_token(
+                config,
+                &OAuthRefreshRequest::from_config(config, refresh_token, Some(token_set.scopes)),
+            )
+            .await
+    })?;
+    save_oauth_credentials(&runtime::OAuthTokenSet {
+        access_token: refreshed.access_token.clone(),
+        refresh_token: refreshed.refresh_token.clone(),
+        expires_at: refreshed.expires_at,
+        scopes: refreshed.scopes.clone(),
+    })
+    .map_err(ApiError::from)?;
+    Ok(Some(refreshed))
+}
+
+fn client_runtime_block_on<F, T>(future: F) -> Result<T, ApiError>
+where
+    F: std::future::Future<Output = Result<T, ApiError>>,
+{
+    tokio::runtime::Runtime::new()
+        .map_err(ApiError::from)?
+        .block_on(future)
+}
+
+fn load_saved_oauth_token() -> Result<Option<OAuthTokenSet>, ApiError> {
+    let token_set = load_oauth_credentials().map_err(ApiError::from)?;
+    Ok(token_set.map(|token_set| OAuthTokenSet {
+        access_token: token_set.access_token,
+        refresh_token: token_set.refresh_token,
+        expires_at: token_set.expires_at,
+        scopes: token_set.scopes,
+    }))
+}
+
+fn now_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
@@ -314,7 +452,7 @@ fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
 
 #[cfg(test)]
 fn read_api_key() -> Result<String, ApiError> {
-    let auth = AuthSource::from_env()?;
+    let auth = AuthSource::from_env_or_saved()?;
     auth.api_key()
         .or_else(|| auth.bearer_token())
         .map(ToOwned::to_owned)
@@ -424,10 +562,18 @@ struct AnthropicErrorBody {
 #[cfg(test)]
 mod tests {
     use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use crate::client::{AuthSource, OAuthTokenSet};
+    use runtime::{clear_oauth_credentials, save_oauth_credentials, OAuthConfig};
+
+    use crate::client::{
+        now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token, AnthropicClient,
+        AuthSource, OAuthTokenSet,
+    };
     use crate::types::{ContentBlockDelta, MessageRequest};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -437,11 +583,53 @@ mod tests {
             .expect("env lock")
     }
 
+    fn temp_config_home() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "api-oauth-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn sample_oauth_config(token_url: String) -> OAuthConfig {
+        OAuthConfig {
+            client_id: "runtime-client".to_string(),
+            authorize_url: "https://console.test/oauth/authorize".to_string(),
+            token_url,
+            callback_port: Some(4545),
+            manual_redirect_url: Some("https://console.test/oauth/callback".to_string()),
+            scopes: vec!["org:read".to_string(), "user:write".to_string()],
+        }
+    }
+
+    fn spawn_token_server(response_body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        format!("http://{address}/oauth/token")
+    }
+
     #[test]
     fn read_api_key_requires_presence() {
         let _guard = env_lock();
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
         let error = super::read_api_key().expect_err("missing key should error");
         assert!(matches!(error, crate::error::ApiError::MissingApiKey));
     }
@@ -453,6 +641,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_API_KEY");
         let error = super::read_api_key().expect_err("empty key should error");
         assert!(matches!(error, crate::error::ApiError::MissingApiKey));
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
     }
 
     #[test]
@@ -501,6 +690,77 @@ mod tests {
     }
 
     #[test]
+    fn auth_source_from_saved_oauth_when_env_absent() {
+        let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::env::set_var("CLAUDE_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "saved-access-token".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(now_unix_timestamp() + 300),
+            scopes: vec!["scope:a".to_string()],
+        })
+        .expect("save oauth credentials");
+
+        let auth = AuthSource::from_env_or_saved().expect("saved auth");
+        assert_eq!(auth.bearer_token(), Some("saved-access-token"));
+
+        clear_oauth_credentials().expect("clear credentials");
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::fs::remove_dir_all(config_home).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn oauth_token_expiry_uses_expires_at_timestamp() {
+        assert!(oauth_token_is_expired(&OAuthTokenSet {
+            access_token: "access-token".to_string(),
+            refresh_token: None,
+            expires_at: Some(1),
+            scopes: Vec::new(),
+        }));
+        assert!(!oauth_token_is_expired(&OAuthTokenSet {
+            access_token: "access-token".to_string(),
+            refresh_token: None,
+            expires_at: Some(now_unix_timestamp() + 60),
+            scopes: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn resolve_saved_oauth_token_refreshes_expired_credentials() {
+        let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::env::set_var("CLAUDE_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "expired-access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            expires_at: Some(1),
+            scopes: vec!["scope:a".to_string()],
+        })
+        .expect("save expired oauth credentials");
+
+        let token_url = spawn_token_server(
+            "{\"access_token\":\"refreshed-token\",\"refresh_token\":\"fresh-refresh\",\"expires_at\":9999999999,\"scopes\":[\"scope:a\"]}",
+        );
+        let resolved = resolve_saved_oauth_token(&sample_oauth_config(token_url))
+            .expect("resolve refreshed token")
+            .expect("token set present");
+        assert_eq!(resolved.access_token, "refreshed-token");
+        let stored = runtime::load_oauth_credentials()
+            .expect("load stored credentials")
+            .expect("stored token set");
+        assert_eq!(stored.access_token, "refreshed-token");
+
+        clear_oauth_credentials().expect("clear credentials");
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::fs::remove_dir_all(config_home).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn message_request_stream_helper_sets_stream_true() {
         let request = MessageRequest {
             model: "claude-3-7-sonnet-latest".to_string(),
@@ -517,7 +777,7 @@ mod tests {
 
     #[test]
     fn backoff_doubles_until_maximum() {
-        let client = super::AnthropicClient::new("test-key").with_retry_policy(
+        let client = AnthropicClient::new("test-key").with_retry_policy(
             3,
             Duration::from_millis(10),
             Duration::from_millis(25),
