@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
     AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
@@ -21,15 +22,23 @@ use runtime::{
     PermissionMode, PermissionPolicy, ProjectContext, RuntimeError, Session, TokenUsage, ToolError,
     ToolExecutor, UsageTracker,
 };
+use serde_json::json;
 use tools::{execute_tool, mvp_tool_specs};
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const DEFAULT_MAX_TOKENS: u32 = 32;
 const DEFAULT_DATE: &str = "2026-03-31";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_TARGET: Option<&str> = option_env!("TARGET");
+const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("{error}");
+        eprintln!(
+            "error: {error}
+
+Run `rusty-claude-cli --help` for usage."
+        );
         std::process::exit(1);
     }
 }
@@ -44,7 +53,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             commands,
         } => resume_session(&session_path, &commands),
-        CliAction::Prompt { prompt, model } => LiveCli::new(model, false)?.run_turn(&prompt)?,
+        CliAction::Prompt {
+            prompt,
+            model,
+            output_format,
+        } => LiveCli::new(model, false)?.run_turn_with_output(&prompt, output_format)?,
         CliAction::Repl { model } => run_repl(model)?,
         CliAction::Help => print_help(),
     }
@@ -66,15 +79,36 @@ enum CliAction {
     Prompt {
         prompt: String,
         model: String,
+        output_format: CliOutputFormat,
     },
     Repl {
         model: String,
     },
+    // prompt-mode formatting is only supported for non-interactive runs
     Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliOutputFormat {
+    Text,
+    Json,
+}
+
+impl CliOutputFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(format!(
+                "unsupported value for --output-format: {other} (expected text or json)"
+            )),
+        }
+    }
 }
 
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
+    let mut output_format = CliOutputFormat::Text;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -89,6 +123,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--model=") => {
                 model = flag[8..].to_string();
+                index += 1;
+            }
+            "--output-format" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --output-format".to_string())?;
+                output_format = CliOutputFormat::parse(value)?;
+                index += 2;
+            }
+            flag if flag.starts_with("--output-format=") => {
+                output_format = CliOutputFormat::parse(&flag[16..])?;
                 index += 1;
             }
             other => {
@@ -117,8 +162,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             if prompt.trim().is_empty() {
                 return Err("prompt subcommand requires a prompt string".to_string());
             }
-            Ok(CliAction::Prompt { prompt, model })
+            Ok(CliAction::Prompt {
+                prompt,
+                model,
+                output_format,
+            })
         }
+        other if !other.starts_with('/') => Ok(CliAction::Prompt {
+            prompt: rest.join(" "),
+            model,
+            output_format,
+        }),
         other => Err(format!("unknown subcommand: {other}")),
     }
 }
@@ -441,6 +495,7 @@ fn find_git_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(PathBuf::from(path))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_resume_command(
     session_path: &Path,
     session: &Session,
@@ -525,9 +580,30 @@ fn run_resume_command(
             session: session.clone(),
             message: Some(init_claude_md()?),
         }),
+        SlashCommand::Diff => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_diff_report()?),
+        }),
+        SlashCommand::Version => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_version_report()),
+        }),
+        SlashCommand::Export { path } => {
+            let export_path = resolve_export_path(path.as_deref(), session)?;
+            fs::write(&export_path, render_export_text(session))?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
+                    export_path.display(),
+                    session.messages.len(),
+                )),
+            })
+        }
         SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
+        | SlashCommand::Session { .. }
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
@@ -535,8 +611,7 @@ fn run_resume_command(
 fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = LiveCli::new(model, true)?;
     let editor = input::LineEditor::new("› ");
-    println!("Rusty Claude CLI interactive mode");
-    println!("Type /help for commands. Shift+Enter or Ctrl+J inserts a newline.");
+    println!("{}", cli.startup_banner());
 
     while let Some(input) = editor.read_line()? {
         let trimmed = input.trim();
@@ -556,26 +631,57 @@ fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct SessionHandle {
+    id: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedSessionSummary {
+    id: String,
+    path: PathBuf,
+    modified_epoch_secs: u64,
+    message_count: usize,
+}
+
 struct LiveCli {
     model: String,
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+    session: SessionHandle,
 }
 
 impl LiveCli {
     fn new(model: String, enable_tools: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
+        let session = create_managed_session_handle()?;
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
             system_prompt.clone(),
             enable_tools,
         )?;
-        Ok(Self {
+        let cli = Self {
             model,
             system_prompt,
             runtime,
-        })
+            session,
+        };
+        cli.persist_session()?;
+        Ok(cli)
+    }
+
+    fn startup_banner(&self) -> String {
+        format!(
+            "Rusty Claude CLI\n  Model            {}\n  Working directory {}\n  Session          {}\n\nType /help for commands. Shift+Enter or Ctrl+J inserts a newline.",
+            self.model,
+            env::current_dir().map_or_else(
+                |_| "<unknown>".to_string(),
+                |path| path.display().to_string(),
+            ),
+            self.session.id,
+        )
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -595,6 +701,7 @@ impl LiveCli {
                     &mut stdout,
                 )?;
                 println!();
+                self.persist_session()?;
                 Ok(())
             }
             Err(error) => {
@@ -606,6 +713,60 @@ impl LiveCli {
                 Err(Box::new(error))
             }
         }
+    }
+
+    fn run_turn_with_output(
+        &mut self,
+        input: &str,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match output_format {
+            CliOutputFormat::Text => self.run_turn(input),
+            CliOutputFormat::Json => self.run_prompt_json(input),
+        }
+    }
+
+    fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let client = AnthropicClient::from_env()?;
+        let request = MessageRequest {
+            model: self.model.clone(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: input.to_string(),
+                }],
+            }],
+            system: (!self.system_prompt.is_empty()).then(|| self.system_prompt.join("\n\n")),
+            tools: None,
+            tool_choice: None,
+            stream: false,
+        };
+        let runtime = tokio::runtime::Runtime::new()?;
+        let response = runtime.block_on(client.send_message(&request))?;
+        let text = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                OutputContentBlock::Text { text } => Some(text.as_str()),
+                OutputContentBlock::ToolUse { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        println!(
+            "{}",
+            json!({
+                "message": text,
+                "model": self.model,
+                "usage": {
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                    "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": response.usage.cache_read_input_tokens,
+                }
+            })
+        );
+        Ok(())
     }
 
     fn handle_repl_command(
@@ -624,8 +785,19 @@ impl LiveCli {
             SlashCommand::Config { section } => Self::print_config(section.as_deref())?,
             SlashCommand::Memory => Self::print_memory()?,
             SlashCommand::Init => Self::run_init()?,
+            SlashCommand::Diff => Self::print_diff()?,
+            SlashCommand::Version => Self::print_version(),
+            SlashCommand::Export { path } => self.export_session(path.as_deref())?,
+            SlashCommand::Session { action, target } => {
+                self.handle_session_command(action.as_deref(), target.as_deref())?;
+            }
             SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
         }
+        Ok(())
+    }
+
+    fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.runtime.session().save_to_path(&self.session.path)?;
         Ok(())
     }
 
@@ -644,7 +816,7 @@ impl LiveCli {
                     estimated_tokens: self.runtime.estimated_tokens(),
                 },
                 permission_mode_label(),
-                &status_context(None).expect("status context should load"),
+                &status_context(Some(&self.session.path)).expect("status context should load"),
             )
         );
     }
@@ -679,6 +851,7 @@ impl LiveCli {
         let message_count = session.messages.len();
         self.runtime = build_runtime(session, model.clone(), self.system_prompt.clone(), true)?;
         self.model.clone_from(&model);
+        self.persist_session()?;
         println!(
             "{}",
             format_model_switch_report(&previous, &model, message_count)
@@ -694,7 +867,7 @@ impl LiveCli {
 
         let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
             format!(
-                "Unsupported permission mode '{mode}'. Use read-only, workspace-write, or danger-full-access."
+                "unsupported permission mode '{mode}'. Use read-only, workspace-write, or danger-full-access."
             )
         })?;
 
@@ -712,6 +885,7 @@ impl LiveCli {
             true,
             normalized,
         )?;
+        self.persist_session()?;
         println!(
             "{}",
             format_permissions_switch_report(&previous, normalized)
@@ -727,6 +901,7 @@ impl LiveCli {
             return Ok(());
         }
 
+        self.session = create_managed_session_handle()?;
         self.runtime = build_runtime_with_permission_mode(
             Session::new(),
             self.model.clone(),
@@ -734,13 +909,12 @@ impl LiveCli {
             true,
             permission_mode_label(),
         )?;
+        self.persist_session()?;
         println!(
-            "Session cleared
-  Mode             fresh session
-  Preserved model  {}
-  Permission mode  {}",
+            "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
             self.model,
-            permission_mode_label()
+            permission_mode_label(),
+            self.session.id,
         );
         Ok(())
     }
@@ -754,12 +928,13 @@ impl LiveCli {
         &mut self,
         session_path: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(session_path) = session_path else {
+        let Some(session_ref) = session_path else {
             println!("Usage: /resume <session-path>");
             return Ok(());
         };
 
-        let session = Session::load_from_path(&session_path)?;
+        let handle = resolve_session_reference(&session_ref)?;
+        let session = Session::load_from_path(&handle.path)?;
         let message_count = session.messages.len();
         self.runtime = build_runtime_with_permission_mode(
             session,
@@ -768,9 +943,15 @@ impl LiveCli {
             true,
             permission_mode_label(),
         )?;
+        self.session = handle;
+        self.persist_session()?;
         println!(
             "{}",
-            format_resume_report(&session_path, message_count, self.runtime.usage().turns())
+            format_resume_report(
+                &self.session.path.display().to_string(),
+                message_count,
+                self.runtime.usage().turns(),
+            )
         );
         Ok(())
     }
@@ -790,6 +971,71 @@ impl LiveCli {
         Ok(())
     }
 
+    fn print_diff() -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_diff_report()?);
+        Ok(())
+    }
+
+    fn print_version() {
+        println!("{}", render_version_report());
+    }
+
+    fn export_session(
+        &self,
+        requested_path: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let export_path = resolve_export_path(requested_path, self.runtime.session())?;
+        fs::write(&export_path, render_export_text(self.runtime.session()))?;
+        println!(
+            "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
+            export_path.display(),
+            self.runtime.session().messages.len(),
+        );
+        Ok(())
+    }
+
+    fn handle_session_command(
+        &mut self,
+        action: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match action {
+            None | Some("list") => {
+                println!("{}", render_session_list(&self.session.id)?);
+                Ok(())
+            }
+            Some("switch") => {
+                let Some(target) = target else {
+                    println!("Usage: /session switch <session-id>");
+                    return Ok(());
+                };
+                let handle = resolve_session_reference(target)?;
+                let session = Session::load_from_path(&handle.path)?;
+                let message_count = session.messages.len();
+                self.runtime = build_runtime_with_permission_mode(
+                    session,
+                    self.model.clone(),
+                    self.system_prompt.clone(),
+                    true,
+                    permission_mode_label(),
+                )?;
+                self.session = handle;
+                self.persist_session()?;
+                println!(
+                    "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
+                    self.session.id,
+                    self.session.path.display(),
+                    message_count,
+                );
+                Ok(())
+            }
+            Some(other) => {
+                println!("Unknown /session action '{other}'. Use /session list or /session switch <session-id>.");
+                Ok(())
+            }
+        }
+    }
+
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let result = self.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
@@ -802,9 +1048,110 @@ impl LiveCli {
             true,
             permission_mode_label(),
         )?;
+        self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
         Ok(())
     }
+}
+
+fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let path = cwd.join(".claude").join("sessions");
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn create_managed_session_handle() -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let id = generate_session_id();
+    let path = sessions_dir()?.join(format!("{id}.json"));
+    Ok(SessionHandle { id, path })
+}
+
+fn generate_session_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("session-{millis}")
+}
+
+fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let direct = PathBuf::from(reference);
+    let path = if direct.exists() {
+        direct
+    } else {
+        sessions_dir()?.join(format!("{reference}.json"))
+    };
+    if !path.exists() {
+        return Err(format!("session not found: {reference}").into());
+    }
+    let id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(reference)
+        .to_string();
+    Ok(SessionHandle { id, path })
+}
+
+fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    let mut sessions = Vec::new();
+    for entry in fs::read_dir(sessions_dir()?)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let modified_epoch_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let message_count = Session::load_from_path(&path)
+            .map(|session| session.messages.len())
+            .unwrap_or_default();
+        let id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        sessions.push(ManagedSessionSummary {
+            id,
+            path,
+            modified_epoch_secs,
+            message_count,
+        });
+    }
+    sessions.sort_by(|left, right| right.modified_epoch_secs.cmp(&left.modified_epoch_secs));
+    Ok(sessions)
+}
+
+fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let sessions = list_managed_sessions()?;
+    let mut lines = vec![
+        "Sessions".to_string(),
+        format!("  Directory         {}", sessions_dir()?.display()),
+    ];
+    if sessions.is_empty() {
+        lines.push("  No managed sessions saved yet.".to_string());
+        return Ok(lines.join("\n"));
+    }
+    for session in sessions {
+        let marker = if session.id == active_session_id {
+            "● current"
+        } else {
+            "○ saved"
+        };
+        lines.push(format!(
+            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified} path={path}",
+            id = session.id,
+            msgs = session.message_count,
+            modified = session.modified_epoch_secs,
+            path = session.path.display(),
+        ));
+    }
+    Ok(lines.join("\n"))
 }
 
 fn render_repl_help() -> String {
@@ -1094,6 +1441,120 @@ fn permission_mode_label() -> &'static str {
         Ok(value) if value == "danger-full-access" => "danger-full-access",
         _ => "workspace-write",
     }
+}
+
+fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "--", ":(exclude).omx"])
+        .current_dir(env::current_dir()?)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git diff failed: {stderr}").into());
+    }
+    let diff = String::from_utf8(output.stdout)?;
+    if diff.trim().is_empty() {
+        return Ok(
+            "Diff\n  Result           clean working tree\n  Detail           no current changes"
+                .to_string(),
+        );
+    }
+    Ok(format!("Diff\n\n{}", diff.trim_end()))
+}
+
+fn render_version_report() -> String {
+    let git_sha = GIT_SHA.unwrap_or("unknown");
+    let target = BUILD_TARGET.unwrap_or("unknown");
+    format!(
+        "Version\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+    )
+}
+
+fn render_export_text(session: &Session) -> String {
+    let mut lines = vec!["# Conversation Export".to_string(), String::new()];
+    for (index, message) in session.messages.iter().enumerate() {
+        let role = match message.role {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        };
+        lines.push(format!("## {}. {role}", index + 1));
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::ToolUse { id, name, input } => {
+                    lines.push(format!("[tool_use id={id} name={name}] {input}"));
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    is_error,
+                } => {
+                    lines.push(format!(
+                        "[tool_result id={tool_use_id} name={tool_name} error={is_error}] {output}"
+                    ));
+                }
+            }
+        }
+        lines.push(String::new());
+    }
+    lines.join("\n")
+}
+
+fn default_export_filename(session: &Session) -> String {
+    let stem = session
+        .messages
+        .iter()
+        .find_map(|message| match message.role {
+            MessageRole::User => message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .map_or("conversation", |text| {
+            text.lines().next().unwrap_or("conversation")
+        })
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("-");
+    let fallback = if stem.is_empty() {
+        "conversation"
+    } else {
+        &stem
+    };
+    format!("{fallback}.txt")
+}
+
+fn resolve_export_path(
+    requested_path: Option<&str>,
+    session: &Session,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let file_name =
+        requested_path.map_or_else(|| default_export_filename(session), ToOwned::to_owned);
+    let final_name = if Path::new(&file_name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+    {
+        file_name
+    } else {
+        format!("{file_name}.txt")
+    };
+    Ok(cwd.join(final_name))
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -1400,18 +1861,24 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 }
 
 fn print_help() {
-    println!("rusty-claude-cli");
+    println!("rusty-claude-cli v{VERSION}");
     println!();
     println!("Usage:");
     println!("  rusty-claude-cli [--model MODEL]");
-    println!("      Start interactive REPL");
-    println!("  rusty-claude-cli [--model MODEL] prompt TEXT");
-    println!("      Send one prompt and stream the response");
+    println!("      Start the interactive REPL");
+    println!("  rusty-claude-cli [--model MODEL] [--output-format text|json] prompt TEXT");
+    println!("      Send one prompt and exit");
+    println!("  rusty-claude-cli [--model MODEL] [--output-format text|json] TEXT");
+    println!("      Shorthand non-interactive prompt mode");
     println!("  rusty-claude-cli --resume SESSION.json [/status] [/compact] [...]");
     println!("      Inspect or maintain a saved session without entering the REPL");
     println!("  rusty-claude-cli dump-manifests");
     println!("  rusty-claude-cli bootstrap-plan");
     println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
+    println!();
+    println!("Flags:");
+    println!("  --model MODEL              Override the active model");
+    println!("  --output-format FORMAT     Non-interactive output format: text or json");
     println!();
     println!("Interactive slash commands:");
     println!("{}", render_slash_command_help());
@@ -1426,8 +1893,9 @@ fn print_help() {
         .join(", ");
     println!("Resume-safe commands: {resume_commands}");
     println!("Examples:");
-    println!("  rusty-claude-cli --resume session.json /status /compact /cost");
-    println!("  rusty-claude-cli --resume session.json /memory /config");
+    println!("  rusty-claude-cli --model claude-opus \"summarize this repo\"");
+    println!("  rusty-claude-cli --output-format json prompt \"explain src/main.rs\"");
+    println!("  rusty-claude-cli --resume session.json /status /diff /export notes.txt");
 }
 
 #[cfg(test)]
@@ -1438,7 +1906,7 @@ mod tests {
         format_resume_report, format_status_report, normalize_permission_mode, parse_args,
         parse_git_status_metadata, render_config_report, render_init_claude_md,
         render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
-        CliAction, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole};
     use std::path::{Path, PathBuf};
@@ -1465,6 +1933,26 @@ mod tests {
             CliAction::Prompt {
                 prompt: "hello world".to_string(),
                 model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_bare_prompt_and_json_output_flag() {
+        let args = vec![
+            "--output-format=json".to_string(),
+            "--model".to_string(),
+            "claude-opus".to_string(),
+            "explain".to_string(),
+            "this".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Prompt {
+                prompt: "explain this".to_string(),
+                model: "claude-opus".to_string(),
+                output_format: CliOutputFormat::Json,
             }
         );
     }
@@ -1546,6 +2034,10 @@ mod tests {
         assert!(help.contains("/config [env|hooks|model]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
+        assert!(help.contains("/diff"));
+        assert!(help.contains("/version"));
+        assert!(help.contains("/export [file]"));
+        assert!(help.contains("/session [list|switch <session-id>]"));
         assert!(help.contains("/exit"));
     }
 
@@ -1557,7 +2049,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["help", "status", "compact", "clear", "cost", "config", "memory", "init",]
+            vec![
+                "help", "status", "compact", "clear", "cost", "config", "memory", "init", "diff",
+                "version", "export",
+            ]
         );
     }
 
