@@ -1,12 +1,12 @@
 # Mock LLM parity harness
 
-这一里程碑新增了一个确定性的 Anthropic-compatible mock service，以及一个可复现的 CLI harness，用于验证 Rust 版 `claw` 二进制。
+这个里程碑增加了一个确定性的 Anthropic 兼容 mock 服务，以及一个用于 Rust `claw` 二进制的可复现 CLI harness。
 
 ## 产物
 
-- `crates/mock-anthropic-service/` —— mock `/v1/messages` service
-- `crates/rusty-claude-cli/tests/mock_parity_harness.rs` —— 端到端的 clean-environment harness
-- `scripts/run_mock_parity_harness.sh` —— 便捷封装脚本
+- `crates/mock-anthropic-service/` — mock `/v1/messages` 服务
+- `crates/rusty-claude-cli/tests/mock_parity_harness.rs` — 端到端干净环境 harness
+- `scripts/run_mock_parity_harness.sh` — 便捷包装脚本
 
 ## 场景
 
@@ -37,13 +37,13 @@ cd rust/
 python3 scripts/run_mock_parity_diff.py
 ```
 
-场景到 PARITY 的映射存放在 `mock_parity_scenarios.json` 中。
+场景到 PARITY 的映射位于 `mock_parity_scenarios.json`。
 
-## 手动启动 mock server
+## 手动 mock 服务器
 
 ```bash
 cd rust/
 cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
 ```
 
-server 会打印 `MOCK_ANTHROPIC_BASE_URL=...`；把 `ANTHROPIC_BASE_URL` 指向这个 URL，并使用任意非空的 `ANTHROPIC_API_KEY` 即可。
+服务器会打印 `MOCK_ANTHROPIC_BASE_URL=...`；将 `ANTHROPIC_BASE_URL` 指向该 URL，并使用任意非空的 `ANTHROPIC_API_KEY`。
