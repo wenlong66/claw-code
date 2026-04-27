@@ -22,6 +22,11 @@ pub enum ApiError {
     MissingCredentials {
         provider: &'static str,
         env_vars: &'static [&'static str],
+        /// Optional, runtime-computed hint appended to the error Display
+        /// output. Populated when the provider resolver can infer what the
+        /// user probably intended (e.g. an `OpenAI` key is set but Anthropic
+        /// was selected because no Anthropic credentials exist).
+        hint: Option<String>,
     },
     ContextWindowExceeded {
         model: String,
@@ -48,6 +53,8 @@ pub enum ApiError {
         request_id: Option<String>,
         body: String,
         retryable: bool,
+        /// Suggested user action based on error type (e.g., "Reduce prompt size" for 413)
+        suggested_action: Option<String>,
     },
     RetriesExhausted {
         attempts: u32,
@@ -58,6 +65,11 @@ pub enum ApiError {
         attempt: u32,
         base_delay: Duration,
     },
+    RequestBodySizeExceeded {
+        estimated_bytes: usize,
+        max_bytes: usize,
+        provider: &'static str,
+    },
 }
 
 impl ApiError {
@@ -66,7 +78,29 @@ impl ApiError {
         provider: &'static str,
         env_vars: &'static [&'static str],
     ) -> Self {
-        Self::MissingCredentials { provider, env_vars }
+        Self::MissingCredentials {
+            provider,
+            env_vars,
+            hint: None,
+        }
+    }
+
+    /// Build a `MissingCredentials` error carrying an extra, runtime-computed
+    /// hint string that the Display impl appends after the canonical "missing
+    /// <provider> credentials" message. Used by the provider resolver to
+    /// suggest the likely fix when the user has credentials for a different
+    /// provider already in the environment.
+    #[must_use]
+    pub fn missing_credentials_with_hint(
+        provider: &'static str,
+        env_vars: &'static [&'static str],
+        hint: impl Into<String>,
+    ) -> Self {
+        Self::MissingCredentials {
+            provider,
+            env_vars,
+            hint: Some(hint.into()),
+        }
     }
 
     /// Build a `Self::Json` enriched with the provider name, the model that
@@ -102,7 +136,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => false,
         }
     }
 
@@ -120,7 +155,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => None,
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => None,
         }
     }
 
@@ -145,6 +181,7 @@ impl ApiError {
                 "provider_transport"
             }
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
+            Self::RequestBodySizeExceeded { .. } => "request_size",
         }
     }
 
@@ -167,7 +204,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => false,
         }
     }
 
@@ -196,15 +234,21 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => false,
         }
     }
 }
 
 impl Display for ApiError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingCredentials { provider, env_vars } => {
+            Self::MissingCredentials {
+                provider,
+                env_vars,
+                hint,
+            } => {
                 write!(
                     f,
                     "missing {provider} credentials; export {} before calling the {provider} API",
@@ -222,6 +266,9 @@ impl Display for ApiError {
                             " (on Windows, environment variables set in PowerShell only persist for the current session; use `setx` to make them permanent, then open a new terminal, or place a `.env` file in the current working directory)"
                         )?;
                     }
+                }
+                if let Some(hint) = hint {
+                    write!(f, " — hint: {hint}")?;
                 }
                 Ok(())
             }
@@ -289,6 +336,14 @@ impl Display for ApiError {
             } => write!(
                 f,
                 "retry backoff overflowed on attempt {attempt} with base delay {base_delay:?}"
+            ),
+            Self::RequestBodySizeExceeded {
+                estimated_bytes,
+                max_bytes,
+                provider,
+            } => write!(
+                f,
+                "request body size ({estimated_bytes} bytes) exceeds {provider} limit ({max_bytes} bytes); reduce prompt length or context before retrying"
             ),
         }
     }
@@ -435,6 +490,7 @@ mod tests {
             request_id: Some("req_jobdori_123".to_string()),
             body: String::new(),
             retryable: true,
+            suggested_action: None,
         };
 
         assert!(error.is_generic_fatal_wrapper());
@@ -457,6 +513,7 @@ mod tests {
                 request_id: Some("req_nested_456".to_string()),
                 body: String::new(),
                 retryable: true,
+                suggested_action: None,
             }),
         };
 
@@ -477,10 +534,63 @@ mod tests {
             request_id: Some("req_ctx_123".to_string()),
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         assert!(error.is_context_window_failure());
         assert_eq!(error.safe_failure_class(), "context_window");
         assert_eq!(error.request_id(), Some("req_ctx_123"));
+    }
+
+    #[test]
+    fn missing_credentials_without_hint_renders_the_canonical_message() {
+        // given
+        let error = ApiError::missing_credentials(
+            "Anthropic",
+            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+        );
+
+        // when
+        let rendered = error.to_string();
+
+        // then
+        assert!(
+            rendered.starts_with(
+                "missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Anthropic API"
+            ),
+            "rendered error should lead with the canonical missing-credential message: {rendered}"
+        );
+        assert!(
+            !rendered.contains(" — hint: "),
+            "no hint should be appended when none is supplied: {rendered}"
+        );
+    }
+
+    #[test]
+    fn missing_credentials_with_hint_appends_the_hint_after_base_message() {
+        // given
+        let error = ApiError::missing_credentials_with_hint(
+            "Anthropic",
+            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+            "I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.",
+        );
+
+        // when
+        let rendered = error.to_string();
+
+        // then
+        assert!(
+            rendered.starts_with("missing Anthropic credentials;"),
+            "hint should be appended, not replace the base message: {rendered}"
+        );
+        let hint_marker = " — hint: I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.";
+        assert!(
+            rendered.ends_with(hint_marker),
+            "rendered error should end with the hint: {rendered}"
+        );
+        // Classification semantics are unaffected by the presence of a hint.
+        assert_eq!(error.safe_failure_class(), "provider_auth");
+        assert!(!error.is_retryable());
+        assert_eq!(error.request_id(), None);
     }
 }
