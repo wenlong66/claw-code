@@ -11,3 +11,4 @@ archive/
 .clawhip/
 status-help.txt
 rust/.claw/
+.env
