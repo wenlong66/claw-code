@@ -12,3 +12,4 @@ archive/
 status-help.txt
 rust/.claw/
 .env
+.claw/plugins

@@ -1,5 +1,14 @@
 {
   "aliases": {
-    "quick": "haiku"
+    "fast": "deepseek-v4-flash",
+    "smart": "deepseek-v4-flash",
+    "cheap": "deepseek-v4-flash"
+  },
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    }
   }
 }
